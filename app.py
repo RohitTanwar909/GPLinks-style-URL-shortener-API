@@ -1,132 +1,335 @@
+
 import os
 import re
 import json
 from urllib.parse import urlparse
 
 import requests
-from fastapi import FastAPI, HTTPException, Header, Query
-from pydantic import BaseModel, HttpUrl
+from fastapi import FastAPI, HTTPException, Header, Depends
+from pydantic import BaseModel, HttpUrl, Field
+from typing import List
 
-app = FastAPI(title="GPLinks Wrapper API", version="1.0.0")
+app = FastAPI(
+    title="GPLinks Style URL Shortener API",
+    description="URL shortener API powered by GPLinks",
+    version="1.0.0"
+)
 
+# Environment variables
 GPLINKS_API_KEY = os.getenv("GPLINKS_API_KEY", "").strip()
-API_SECRET = os.getenv("API_SECRET", "").strip()  # optional: protects your Render API
+API_SECRET = os.getenv("API_SECRET", "").strip()
+
 GPLINKS_ENDPOINT = "https://api.gplinks.com/st"
-TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT", "20"))
+TIMEOUT = 30
+
+
+# -----------------------------
+# API Authentication
+# -----------------------------
+
+def verify_api_key(
+    x_api_key: str = Header(default=None)
+):
+    if API_SECRET and x_api_key != API_SECRET:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or missing API key"
+        )
+
+
+# -----------------------------
+# Request Models
+# -----------------------------
 
 class ShortenRequest(BaseModel):
     url: HttpUrl
+
+
 class BulkRequest(BaseModel):
-    urls: list[HttpUrl]
+    urls: List[HttpUrl] = Field(min_length=1, max_length=100)
 
 
-def auth_check(x_api_key: str | None):
-    if API_SECRET and x_api_key != API_SECRET:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+# -----------------------------
+# URL Validation
+# -----------------------------
 
-
-def validate_destination(url: str) -> str:
+def validate_url(url: str):
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise HTTPException(status_code=400, detail="Only valid http/https URLs are allowed")
+
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only HTTP and HTTPS URLs are supported")
+
+    if not parsed.netloc:
+        raise ValueError("Invalid destination URL")
+
     return url
 
 
-def extract_short_url(response: requests.Response) -> str | None:
-    # GPLinks response formats may vary. Check redirect Location, JSON fields, then text URL.
-    location = response.headers.get("Location")
-    if location and "gplinks" in location.lower():
-        return location
+# -----------------------------
+# Extract Short URL
+# -----------------------------
 
-    body = response.text.strip()
+def extract_short_url(response, original_url):
+    original_host = urlparse(original_url).netloc.lower()
+
+    # 1. Check redirect response
+    location = response.headers.get("Location")
+
+    if location:
+        parsed = urlparse(location)
+
+        if (
+            parsed.scheme in ("http", "https")
+            and parsed.netloc.lower() != original_host
+            and parsed.netloc.lower() != "api.gplinks.com"
+        ):
+            return location
+
+    text = response.text.strip()
+
+    # 2. Check JSON response
     try:
         data = response.json()
-        if isinstance(data, dict):
-            for key in ("short_url", "shortlink", "short", "url", "link"):
-                value = data.get(key)
-                if isinstance(value, str) and value.startswith(("http://", "https://")):
-                    return value
-            # Return useful provider error messages if present
-            if data.get("error") or data.get("message"):
-                raise HTTPException(status_code=502, detail=f"GPLinks response: {data.get('error') or data.get('message')}")
-    except ValueError:
+
+        def find_url(obj):
+            if isinstance(obj, dict):
+                # Check likely short URL fields first
+                for key, value in obj.items():
+                    key_lower = key.lower().replace("_", "").replace("-", "")
+
+                    if (
+                        isinstance(value, str)
+                        and ("short" in key_lower or key_lower in ("link", "url"))
+                    ):
+                        candidate = value.strip()
+
+                        if candidate.startswith(("http://", "https://")):
+                            parsed = urlparse(candidate)
+
+                            if (
+                                parsed.netloc.lower() != original_host
+                                and parsed.netloc.lower() != "api.gplinks.com"
+                            ):
+                                return candidate
+
+                for value in obj.values():
+                    result = find_url(value)
+                    if result:
+                        return result
+
+            elif isinstance(obj, list):
+                for item in obj:
+                    result = find_url(item)
+                    if result:
+                        return result
+
+            return None
+
+        result = find_url(data)
+
+        if result:
+            return result
+
+    except (ValueError, TypeError):
         pass
 
+    # 3. Check plain text and HTML for URLs
+    matches = re.findall(
+        r'https?://[^\s"\'<>]+',
+        text
+    )
 
-    # Look for a URL in plain-text/HTML response
-    matches = re.findall(r'https?://[^\s"\'<>]+', body)
     for candidate in matches:
         candidate = candidate.rstrip(".,;)")
-        if "gplinks" in candidate.lower():
+        parsed = urlparse(candidate)
+
+        if (
+            parsed.netloc
+            and parsed.netloc.lower() != original_host
+            and parsed.netloc.lower() != "api.gplinks.com"
+        ):
             return candidate
-    if body.startswith("http://") or body.startswith("https://"):
-        return body.splitlines()[0].strip()
-    return None
+
+    # 4. Check plain text containing only a short URL
+    if text.startswith(("http://", "https://")):
+        candidate = text.splitlines()[0].strip()
+        parsed = urlparse(candidate)
+
+        if (
+            parsed.netloc
+            and parsed.netloc.lower() != original_host
+            and parsed.netloc.lower() != "api.gplinks.com"
+        ):
+            return candidate
+
+    raise ValueError(
+        "Could not extract short URL from GPLinks response. "
+        f"HTTP status: {response.status_code}. "
+        f"Response: {text[:500]}"
+    )
 
 
+# -----------------------------
+# GPLinks Shortener
+# -----------------------------
 
-def shorten_one(destination: str) -> dict:
+def gplinks_shorten(url: str):
+
     if not GPLINKS_API_KEY:
-        raise HTTPException(status_code=500, detail="Render environment variable GPLINKS_API_KEY is not set")
-    destination = validate_destination(str(destination))
-    try:
-        # Do not follow redirects: if provider returns a redirect, capture its Location.
-        res = requests.get(
-            GPLINKS_ENDPOINT,
-            params={"api": GPLINKS_API_KEY, "url": destination},
-            timeout=TIMEOUT_SECONDS,
-            allow_redirects=False,
-            headers={"User-Agent": "GPLinks-Wrapper/1.0"},
+        raise ValueError(
+            "GPLINKS_API_KEY is missing in Render environment variables"
         )
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Could not connect to GPLinks: {exc.__class__.__name__}")
 
-    if res.status_code >= 400:
-        raise HTTPException(status_code=502, detail=f"GPLinks returned HTTP {res.status_code}")
-    short_url = extract_short_url(res)
-    if not short_url:
-        raise HTTPException(status_code=502, detail="Could not parse short link from GPLinks response. Check GPLinks API key or provider response format.")
-    return {"success": True, "original_url": destination, "short_url": short_url, "provider": "gplinks"}
+    url = validate_url(url)
+
+    try:
+        response = requests.get(
+            GPLINKS_ENDPOINT,
+            params={
+                "api": GPLINKS_API_KEY,
+                "url": url
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0 GPLinks-API/1.0"
+            },
+            timeout=TIMEOUT,
+            allow_redirects=False
+        )
+
+        if response.status_code >= 400:
+            raise ValueError(
+                f"GPLinks HTTP error: {response.status_code}. "
+                f"Response: {response.text[:500]}"
+            )
+
+        short_url = extract_short_url(response, url)
+
+        return {
+            "success": True,
+            "original_url": url,
+            "short_url": short_url,
+            "provider": "gplinks"
+        }
+
+    except requests.Timeout:
+        raise ValueError("GPLinks request timed out")
+
+    except requests.RequestException as e:
+        raise ValueError(f"GPLinks connection error: {str(e)}")
 
 
+# -----------------------------
+# API Homepage
+# -----------------------------
 
 @app.get("/")
-def root():
-    return {"name": "GPLinks Wrapper API", "status": "online", "endpoints": ["GET /health", "GET /shorten?url=...", "POST /shorten", "POST /bulk"]}
+def home():
+    return {
+        "success": True,
+        "name": "GPLinks Style URL Shortener API",
+        "version": "1.0.0",
+        "provider": "gplinks",
+        "endpoints": {
+            "health": "/health",
+            "shorten_get": "/shorten?url=YOUR_URL",
+            "shorten_post": "/shorten",
+            "bulk": "/bulk",
+            "docs": "/docs"
+        }
+    }
 
 
+# -----------------------------
+# Health Check
+# -----------------------------
 
 @app.get("/health")
 def health():
-    return {"success": True, "status": "healthy"}
+    return {
+        "success": True,
+        "status": "healthy",
+        "provider": "gplinks",
+        "api_key_configured": bool(GPLINKS_API_KEY)
+    }
 
 
+# -----------------------------
+# GET Shorten Endpoint
+# -----------------------------
 
-@app.get("/shorten")
-def shorten_get(url: HttpUrl = Query(...), x_api_key: str | None = Header(default=None)):
-    auth_check(x_api_key)
-    return shorten_one(str(url))
+@app.get("/shorten", dependencies=[Depends(verify_api_key)])
+def shorten_get(url: str):
+
+    try:
+        return gplinks_shorten(url)
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=str(e)
+        )
 
 
+# -----------------------------
+# POST Shorten Endpoint
+# -----------------------------
 
-@app.post("/shorten")
-def shorten_post(payload: ShortenRequest, x_api_key: str | None = Header(default=None)):
-    auth_check(x_api_key)
-    return shorten_one(str(payload.url))
+@app.post("/shorten", dependencies=[Depends(verify_api_key)])
+def shorten_post(request: ShortenRequest):
+
+    try:
+        return gplinks_shorten(str(request.url))
+
+    except ValueError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=str(e)
+        )
 
 
+# -----------------------------
+# BULK Shorten Endpoint
+# -----------------------------
 
-@app.post("/bulk")
-def shorten_bulk(payload: BulkRequest, x_api_key: str | None = Header(default=None)):
-    auth_check(x_api_key)
-    if not payload.urls:
-        raise HTTPException(status_code=400, detail="Provide at least one URL")
-    if len(payload.urls) > 50:
-        raise HTTPException(status_code=400, detail="Maximum 50 URLs per request")
+@app.post("/bulk", dependencies=[Depends(verify_api_key)])
+def bulk_shorten(request: BulkRequest):
+
     results = []
-    for url in payload.urls:
+
+    for url in request.urls:
         try:
-            results.append(shorten_one(str(url)))
-        except HTTPException as exc:
-            results.append({"success": False, "original_url": str(url), "error": exc.detail})
-    return {"success": all(item.get("success") for item in results), "count": len(results), "results": results}
+            result = gplinks_shorten(str(url))
+            results.append(result)
+
+        except Exception as e:
+            results.append({
+                "success": False,
+                "original_url": str(url),
+                "error": str(e)
+            })
+
+    successful = sum(
+        1 for item in results if item["success"]
+    )
+
+    return {
+        "success": successful > 0,
+        "total": len(results),
+        "successful": successful,
+        "failed": len(results) - successful,
+        "results": results
+    }
+
+
+# -----------------------------
+# Run locally
+# -----------------------------
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", 8000))
+    )
